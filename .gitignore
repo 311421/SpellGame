@@ -31,5 +31,7 @@
 /MLData/Dataset/
 /MLData/Output/
 /MLData/*.json
+/MLData/*.html
+/MLData/_preview*
 __pycache__/
 *.pyc

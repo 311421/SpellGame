@@ -1,0 +1,6 @@
+# CPU is plenty for this: a handful of classes, 32x32 grayscale images, a tiny CNN.
+# Training the whole thing takes well under a minute on a normal laptop CPU.
+torch>=2.2
+torchvision>=0.17
+onnx>=1.15
+onnxscript>=0.1   # required by torch.onnx.export on newer PyTorch (routes through the dynamo exporter)
