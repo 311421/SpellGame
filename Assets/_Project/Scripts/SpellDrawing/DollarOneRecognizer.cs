@@ -34,9 +34,20 @@ namespace SpellDrawing
 
         public static Result Recognize(IReadOnlyList<Vector2> rawPoints, IReadOnlyList<SpellTemplate> templates)
         {
-            var candidate = Normalize(rawPoints);
+            // $1's rotation search only covers angle, not tracing direction — a shape drawn clockwise
+            // vs. counterclockwise can score as very dissimilar even though they're the same shape,
+            // since point i is always compared to point i in order. Normalizing both the drawn order
+            // and its reverse, and keeping whichever aligns better per template, makes matching
+            // indifferent to which way the player happened to trace the gesture.
+            var forward = Normalize(rawPoints);
+            var reversedRaw = new List<Vector2>(rawPoints);
+            reversedRaw.Reverse();
+            var backward = Normalize(reversedRaw);
+
             float halfDiagonal = 0.5f * Mathf.Sqrt(SquareSize * SquareSize + SquareSize * SquareSize);
-            float candidateCornerScore = ComputeCornerScore(candidate);
+            // Corner score depends only on local turning-angle magnitude, which reversal doesn't
+            // change, so one direction's value is valid for both.
+            float candidateCornerScore = ComputeCornerScore(forward);
 
             var ranked = new List<(SpellTemplate template, float score)>();
 
@@ -44,8 +55,12 @@ namespace SpellDrawing
             {
                 if (template == null || template.NormalizedPoints.Count != ResampleCount) continue;
 
-                float distance = DistanceAtBestAngle(
-                    candidate, template.NormalizedPoints, -AngleRange, AngleRange, AnglePrecision);
+                float distanceForward = DistanceAtBestAngle(
+                    forward, template.NormalizedPoints, -AngleRange, AngleRange, AnglePrecision);
+                float distanceBackward = DistanceAtBestAngle(
+                    backward, template.NormalizedPoints, -AngleRange, AngleRange, AnglePrecision);
+                float distance = Mathf.Min(distanceForward, distanceBackward);
+
                 float pathScore = Mathf.Clamp01(1f - distance / halfDiagonal);
 
                 float cornerPenalty = Mathf.Abs(candidateCornerScore - template.CornerScore);

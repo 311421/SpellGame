@@ -535,6 +535,7 @@ GameObject:
   - component: {fileID: 1959427293}
   - component: {fileID: 1959427292}
   - component: {fileID: 1959427297}
+  - component: {fileID: 1959427298}
   m_Layer: 0
   m_Name: SpellCaster
   m_TagString: Untagged
@@ -741,6 +742,23 @@ MonoBehaviour:
   previewImage: {fileID: 499083102}
   saveToDisk: 0
   saveFolder: RasterizedStrokes
+--- !u!114 &1959427298
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1959427291}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 58247062d0fff784a8dbc938c5c4cf81, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::SpellDrawing.CV.CnnSpellClassifier
+  modelAsset: {fileID: 5022602860645237092, guid: 204cc7c45bb42ba48bdd2086148ad540, type: 3}
+  classesJson: {fileID: 4900000, guid: 9fc501764b3160a49848b6caecc081d2, type: 3}
+  strokeThicknessPx: 1.75
+  padding: 0.12
+  logPredictions: 1
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

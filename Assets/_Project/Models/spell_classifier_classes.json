@@ -1,0 +1,10 @@
+{
+  "classes": [
+    "Circle",
+    "Flame",
+    "Square",
+    "Star",
+    "Zap"
+  ],
+  "image_size": 48
+}

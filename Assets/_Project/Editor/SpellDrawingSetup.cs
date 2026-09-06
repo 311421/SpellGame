@@ -2,6 +2,7 @@
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.UI;
+using Unity.InferenceEngine;
 using SpellDrawing.CV;
 
 namespace SpellDrawing.EditorTools
@@ -88,6 +89,46 @@ namespace SpellDrawing.EditorTools
                 "with the mouse, and press Space — you'll see it rasterized to a bitmap live. Enable " +
                 "'Save To Disk' on the StrokeRasterizerPreview component (on the SpellCaster object) if " +
                 "you want PNGs written to " + Application.persistentDataPath + ".");
+        }
+
+        [MenuItem("Tools/Spell Drawing/ML/Add CNN Classifier")]
+        public static void AddCnnClassifier()
+        {
+            var caster = Object.FindFirstObjectByType<SpellCaster>();
+            if (caster == null)
+            {
+                Debug.LogWarning("No SpellCaster in the scene yet — run 'Create Spell Caster In Scene' first.");
+                return;
+            }
+
+            var modelGuids = AssetDatabase.FindAssets("spell_classifier t:ModelAsset");
+            ModelAsset model = modelGuids.Length > 0
+                ? AssetDatabase.LoadAssetAtPath<ModelAsset>(AssetDatabase.GUIDToAssetPath(modelGuids[0]))
+                : null;
+            var classesAsset = AssetDatabase.LoadAssetAtPath<TextAsset>(
+                "Assets/_Project/Models/spell_classifier_classes.json");
+
+            if (model == null || classesAsset == null)
+            {
+                Debug.LogWarning(
+                    "Couldn't find spell_classifier.onnx (as a ModelAsset) or spell_classifier_classes.json " +
+                    "under Assets/_Project/Models. If you just added com.unity.ai.inference, let the Editor " +
+                    "finish resolving packages and reimporting the .onnx first, then try again.");
+                return;
+            }
+
+            var classifier = caster.gameObject.GetComponent<CnnSpellClassifier>();
+            if (classifier == null) classifier = caster.gameObject.AddComponent<CnnSpellClassifier>();
+
+            var so = new SerializedObject(classifier);
+            so.FindProperty("modelAsset").objectReferenceValue = model;
+            so.FindProperty("classesJson").objectReferenceValue = classesAsset;
+            so.ApplyModifiedProperties();
+
+            Selection.activeGameObject = caster.gameObject;
+            Debug.Log(
+                "Added CnnSpellClassifier to SpellCaster, wired to spell_classifier.onnx. Enter Play Mode " +
+                "and draw a gesture — CNN predictions log alongside SpellCaster's $1 result, side by side.");
         }
     }
 }

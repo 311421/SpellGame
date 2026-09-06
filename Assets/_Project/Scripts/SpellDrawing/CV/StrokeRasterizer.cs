@@ -54,6 +54,40 @@ namespace SpellDrawing.CV
             return texture;
         }
 
+        /// <summary>Rasterizes into a flat, row-major, top-to-bottom [0,1] float array — ready to hand
+        /// to an ML tensor. Texture2D's own row 0 is the BOTTOM of the image (Unity convention); PNG /
+        /// PIL / PyTorch's row 0 is the TOP. The training set was built from PNGs loaded by PIL, so
+        /// inference must match that row order, not Texture2D's — this is deliberately a separate loop
+        /// from Rasterize() rather than a wrapper around its texture, to avoid a silent vertical flip
+        /// between what the model was trained on and what it sees at runtime.</summary>
+        public static float[] RasterizeToTensorData(
+            IReadOnlyList<List<Vector2>> strokes, int size, float strokeThicknessPx = 2f, float paddingFraction = 0.12f)
+        {
+            var fittedStrokes = FitStrokesToUnitSquare(strokes, paddingFraction);
+            float thicknessNorm = strokeThicknessPx / size;
+
+            var data = new float[size * size];
+            for (int row = 0; row < size; row++)
+            {
+                float yNorm = 1f - (row + 0.5f) / size; // row 0 = top = highest unit-square y
+                for (int x = 0; x < size; x++)
+                {
+                    Vector2 pixelCenter = new Vector2((x + 0.5f) / size, yNorm);
+
+                    float dist = float.MaxValue;
+                    foreach (var stroke in fittedStrokes)
+                    {
+                        float d = DistanceToPolyline(pixelCenter, stroke);
+                        if (d < dist) dist = d;
+                    }
+
+                    float t = Mathf.Clamp01((dist - thicknessNorm * 0.5f) / (thicknessNorm * 0.5f));
+                    data[row * size + x] = 1f - t;
+                }
+            }
+            return data;
+        }
+
         /// <summary>Maps every stroke into [0,1]x[0,1] texture space using one shared transform
         /// so strokes keep their position/size relative to each other.</summary>
         private static List<List<Vector2>> FitStrokesToUnitSquare(

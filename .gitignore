@@ -35,3 +35,6 @@
 /MLData/_preview*
 __pycache__/
 *.pyc
+
+# Hand-drawn spell templates — excluded for now while recording iterations are volatile
+/Assets/_Project/Spells/Templates/
