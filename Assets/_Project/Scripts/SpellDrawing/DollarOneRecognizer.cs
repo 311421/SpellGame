@@ -32,21 +32,22 @@ namespace SpellDrawing
             return points;
         }
 
-        public static Result Recognize(IReadOnlyList<Vector2> rawPoints, IReadOnlyList<SpellTemplate> templates)
+        /// <param name="fullRotationSearch">False (default, live gameplay) searches only +/-45deg
+        /// around the indicative angle. True does a full 360deg search — needed for rotationally
+        /// symmetric shapes, where the indicative angle is arbitrary and a narrow window would only
+        /// sometimes land close enough by luck; costs more, so only the offline dataset generator uses it.</param>
+        public static Result Recognize(
+            IReadOnlyList<Vector2> rawPoints, IReadOnlyList<SpellTemplate> templates, bool fullRotationSearch = false)
         {
-            // $1's rotation search only covers angle, not tracing direction — a shape drawn clockwise
-            // vs. counterclockwise can score as very dissimilar even though they're the same shape,
-            // since point i is always compared to point i in order. Normalizing both the drawn order
-            // and its reverse, and keeping whichever aligns better per template, makes matching
-            // indifferent to which way the player happened to trace the gesture.
+            // Normalize both drawn order and its reverse, keep whichever aligns better per template —
+            // makes matching indifferent to which way the player traced the gesture.
             var forward = Normalize(rawPoints);
             var reversedRaw = new List<Vector2>(rawPoints);
             reversedRaw.Reverse();
             var backward = Normalize(reversedRaw);
 
             float halfDiagonal = 0.5f * Mathf.Sqrt(SquareSize * SquareSize + SquareSize * SquareSize);
-            // Corner score depends only on local turning-angle magnitude, which reversal doesn't
-            // change, so one direction's value is valid for both.
+            // Corner score is unaffected by reversal (turning-angle magnitude only), so one suffices.
             float candidateCornerScore = ComputeCornerScore(forward);
 
             var ranked = new List<(SpellTemplate template, float score)>();
@@ -55,10 +56,12 @@ namespace SpellDrawing
             {
                 if (template == null || template.NormalizedPoints.Count != ResampleCount) continue;
 
-                float distanceForward = DistanceAtBestAngle(
-                    forward, template.NormalizedPoints, -AngleRange, AngleRange, AnglePrecision);
-                float distanceBackward = DistanceAtBestAngle(
-                    backward, template.NormalizedPoints, -AngleRange, AngleRange, AnglePrecision);
+                float distanceForward = fullRotationSearch
+                    ? FindBestRotationDistance(forward, template.NormalizedPoints)
+                    : DistanceAtBestAngle(forward, template.NormalizedPoints, -AngleRange, AngleRange, AnglePrecision);
+                float distanceBackward = fullRotationSearch
+                    ? FindBestRotationDistance(backward, template.NormalizedPoints)
+                    : DistanceAtBestAngle(backward, template.NormalizedPoints, -AngleRange, AngleRange, AnglePrecision);
                 float distance = Mathf.Min(distanceForward, distanceBackward);
 
                 float pathScore = Mathf.Clamp01(1f - distance / halfDiagonal);
@@ -103,6 +106,20 @@ namespace SpellDrawing
             float averageTopAngle = sum / count;
 
             return Mathf.Clamp01(averageTopAngle / (Mathf.PI * 0.5f));
+        }
+
+        /// <summary>Long-side/short-side ratio (always &gt;= 1) after derotating but BEFORE
+        /// ScaleToSquare's non-uniform scale — the one piece of shape info Normalize() discards.</summary>
+        public static float ComputeAspectRatio(IReadOnlyList<Vector2> rawPoints)
+        {
+            var points = Resample(rawPoints, ResampleCount);
+            float radians = IndicativeAngle(points);
+            points = RotateBy(points, -radians);
+
+            Rect box = BoundingBox(points);
+            float w = Mathf.Max(box.width, 0.0001f);
+            float h = Mathf.Max(box.height, 0.0001f);
+            return Mathf.Max(w, h) / Mathf.Min(w, h);
         }
 
         private static List<Vector2> Resample(IReadOnlyList<Vector2> points, int n)
@@ -245,6 +262,31 @@ namespace SpellDrawing
         {
             var rotated = RotateBy(points, radians);
             return PathDistance(rotated, template);
+        }
+
+        /// <summary>Coarse-samples the full circle to find the right basin, then refines with golden-
+        /// section search — a plain wide golden-section search risks the wrong local minimum for
+        /// symmetric shapes (e.g. a square has 4, 90deg apart).</summary>
+        private static float FindBestRotationDistance(
+            List<Vector2> points, IReadOnlyList<Vector2> template, int coarseSamples = 24)
+        {
+            float step = 2f * Mathf.PI / coarseSamples;
+            float bestAngle = 0f;
+            float bestCoarseDistance = float.MaxValue;
+
+            for (int i = 0; i < coarseSamples; i++)
+            {
+                float angle = -Mathf.PI + i * step;
+                float distance = DistanceAtAngle(points, template, angle);
+                if (distance < bestCoarseDistance)
+                {
+                    bestCoarseDistance = distance;
+                    bestAngle = angle;
+                }
+            }
+
+            float halfWindow = step * 0.6f; // a bit over half a coarse step, to safely bracket the true minimum
+            return DistanceAtBestAngle(points, template, bestAngle - halfWindow, bestAngle + halfWindow, AnglePrecision);
         }
     }
 }

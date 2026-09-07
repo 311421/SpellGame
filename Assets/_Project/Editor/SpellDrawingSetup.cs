@@ -130,6 +130,27 @@ namespace SpellDrawing.EditorTools
                 "Added CnnSpellClassifier to SpellCaster, wired to spell_classifier.onnx. Enter Play Mode " +
                 "and draw a gesture — CNN predictions log alongside SpellCaster's $1 result, side by side.");
         }
+
+        [MenuItem("Tools/Spell Drawing/ML/Add Hard Negative Capture")]
+        public static void AddHardNegativeCapture()
+        {
+            var caster = Object.FindFirstObjectByType<SpellCaster>();
+            if (caster == null)
+            {
+                Debug.LogWarning("No SpellCaster in the scene yet — run 'Create Spell Caster In Scene' first.");
+                return;
+            }
+
+            if (caster.gameObject.GetComponent<HardNegativeCapture>() == null)
+                caster.gameObject.AddComponent<HardNegativeCapture>();
+
+            Selection.activeGameObject = caster.gameObject;
+            Debug.Log(
+                "Added HardNegativeCapture to SpellCaster. In Play Mode: draw a gesture, and if it gets " +
+                "misclassified, press N to bank it as a hard negative for whichever class it's set to " +
+                "correct (defaults to the negative class). Run the dataset generator again afterward to " +
+                "fold captured negatives into training.");
+        }
     }
 }
 #endif

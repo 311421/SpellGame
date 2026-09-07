@@ -18,6 +18,10 @@ namespace SpellDrawing.CV
         [SerializeField] private float padding = 0.12f;
         [SerializeField] private bool logPredictions = true;
 
+        [Tooltip("Top prediction must clear this confidence to count as accepted, rather than a low-" +
+                 "confidence near-tie being reported as if it were a real match.")]
+        [SerializeField, Range(0f, 1f)] private float minConfidenceToAccept = 0.6f;
+
         private Worker _worker;
         private string[] _classNames;
         private int _imageSize;
@@ -63,12 +67,16 @@ namespace SpellDrawing.CV
             for (int i = 0; i < result.ranked.Count && i < 3; i++)
                 parts.Add($"{result.ranked[i].name}:{result.ranked[i].confidence:P0}");
 
-            Debug.Log($"[CnnSpellClassifier] '{result.name}' ({result.confidence:P0}) — {string.Join(", ", parts)}", this);
+            string verdict = result.accepted
+                ? $"'{result.name}'"
+                : $"'{result.name}' — below {minConfidenceToAccept:P0} threshold, treated as uncertain";
+            Debug.Log($"[CnnSpellClassifier] {verdict} ({result.confidence:P0}) — {string.Join(", ", parts)}", this);
         }
 
-        /// <summary>Classifies a completed gesture. Returns the top prediction plus every class ranked
-        /// by confidence (softmax over the model's raw logits).</summary>
-        public (string name, float confidence, List<(string name, float confidence)> ranked) Classify(List<List<Vector2>> strokes)
+        /// <summary>Classifies a completed gesture. Returns the top prediction, whether it cleared
+        /// minConfidenceToAccept, and every class ranked by confidence (softmax over raw logits).</summary>
+        public (string name, float confidence, bool accepted, List<(string name, float confidence)> ranked) Classify(
+            List<List<Vector2>> strokes)
         {
             float[] pixels = StrokeRasterizer.RasterizeToTensorData(strokes, _imageSize, strokeThicknessPx, padding);
             using var input = new Tensor<float>(new TensorShape(1, 1, _imageSize, _imageSize), pixels);
@@ -81,7 +89,8 @@ namespace SpellDrawing.CV
             for (int i = 0; i < _classNames.Length; i++) ranked.Add((_classNames[i], probs[i]));
             ranked.Sort((a, b) => b.confidence.CompareTo(a.confidence));
 
-            return (ranked[0].name, ranked[0].confidence, ranked);
+            bool accepted = ranked[0].confidence >= minConfidenceToAccept;
+            return (ranked[0].name, ranked[0].confidence, accepted, ranked);
         }
 
         private static float[] Softmax(float[] logits)

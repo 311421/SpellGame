@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using UnityEditor;
 using UnityEngine;
 using SpellDrawing.CV;
@@ -19,6 +20,7 @@ namespace SpellDrawing.EditorTools
     {
         private string templatesFolder = "Assets/_Project/Spells/Templates";
         private string outputFolder = "MLData/Dataset";
+        private string hardNegativesFolder = "MLData/HardNegatives";
         private int imagesPerClass = 400;
         private float valSplit = 0.15f;
         private int imageSize = 48;
@@ -31,10 +33,16 @@ namespace SpellDrawing.EditorTools
 
         private bool includeNegativeClass = true;
         private string negativeClassName = "NotASpell";
-        private int negativeImagesCount = 800;
-        private float maxSimilarityToRealSpell = 0.7f;
+        private int negativeImagesCount = 600;
+        private float maxSimilarityToRealSpell = 0.75f;
+        private float maxAspectDifferenceToReject = 0.15f;
         private const int NegativeShapePointCount = 48;
         private const int MaxNegativeGenerationAttempts = 30;
+        private const float MaxCornerDifferenceToReject = 0.1f;
+        private const float NegativeJitterFraction = 0.08f;
+
+        private bool regenerateAllClasses = true;
+        private readonly HashSet<string> selectedClassesToRegenerate = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>One recorded example contributing to a class — classes with multiple
         /// SpellTemplate assets sharing the same spellName pool all their recordings together.</summary>
@@ -52,6 +60,11 @@ namespace SpellDrawing.EditorTools
         {
             GUILayout.Label("Source", EditorStyles.boldLabel);
             templatesFolder = EditorGUILayout.TextField("Templates Folder", templatesFolder);
+            hardNegativesFolder = EditorGUILayout.TextField("Hard Negatives Folder", hardNegativesFolder);
+            EditorGUILayout.HelpBox(
+                "Images saved here (via HardNegativeCapture at runtime), under a subfolder per class " +
+                "name, get folded into that class's train/val split on generate — on top of, not " +
+                "instead of, the procedural/recorded sources.", MessageType.None);
 
             GUILayout.Space(8);
             GUILayout.Label("Output", EditorStyles.boldLabel);
@@ -84,6 +97,8 @@ namespace SpellDrawing.EditorTools
                 negativeImagesCount = EditorGUILayout.IntField("Images", negativeImagesCount);
                 maxSimilarityToRealSpell = EditorGUILayout.Slider(
                     "Max Similarity To Real Spell", maxSimilarityToRealSpell, 0.3f, 0.95f);
+                maxAspectDifferenceToReject = EditorGUILayout.Slider(
+                    "Max Aspect Diff To Reject", maxAspectDifferenceToReject, 0.1f, 1f);
             }
 
             GUILayout.Space(8);
@@ -91,11 +106,47 @@ namespace SpellDrawing.EditorTools
             using (new EditorGUI.DisabledScope(!useFixedSeed))
                 seed = EditorGUILayout.IntField("Seed", seed);
 
+            GUILayout.Space(8);
+            GUILayout.Label("Selective Regeneration", EditorStyles.boldLabel);
+            regenerateAllClasses = EditorGUILayout.Toggle("Regenerate All Classes", regenerateAllClasses);
+            using (new EditorGUI.DisabledScope(regenerateAllClasses))
+            {
+                EditorGUILayout.HelpBox(
+                    "Only checked classes are wiped and regenerated — everything else on disk (and in " +
+                    "classes.json) is left exactly as it is. Handy when you only changed one class's " +
+                    "templates or the negative-class generator, and don't want to wait on the rest.",
+                    MessageType.None);
+
+                foreach (string className in GetAvailableClassNames())
+                {
+                    bool isSelected = selectedClassesToRegenerate.Contains(className);
+                    bool newValue = EditorGUILayout.ToggleLeft(className, isSelected);
+                    if (newValue) selectedClassesToRegenerate.Add(className);
+                    else selectedClassesToRegenerate.Remove(className);
+                }
+            }
+
             GUILayout.Space(12);
             if (GUILayout.Button("Generate Dataset", GUILayout.Height(32)))
             {
                 Generate();
             }
+        }
+
+        /// <summary>Class names available for the selective-regeneration checkboxes: every distinct
+        /// spellName found among recorded templates, plus the negative class if enabled. Cheap enough
+        /// to recompute every OnGUI call (names only, no point data).</summary>
+        private List<string> GetAvailableClassNames()
+        {
+            var names = AssetDatabase.FindAssets("t:SpellTemplate", new[] { templatesFolder })
+                .Select(guid => AssetDatabase.LoadAssetAtPath<SpellTemplate>(AssetDatabase.GUIDToAssetPath(guid)))
+                .Where(t => t != null)
+                .Select(t => t.spellName)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (includeNegativeClass) names.Add(negativeClassName);
+            return names;
         }
 
         private void Generate()
@@ -132,32 +183,55 @@ namespace SpellDrawing.EditorTools
             string root = Path.Combine(projectRoot, outputFolder);
             string trainRoot = Path.Combine(root, "train");
             string valRoot = Path.Combine(root, "val");
-
-            if (Directory.Exists(root))
-            {
-                if (!EditorUtility.DisplayDialog("Overwrite Dataset?",
-                        $"'{outputFolder}' already exists. Delete and regenerate?", "Delete & Regenerate", "Cancel"))
-                    return;
-                Directory.Delete(root, true);
-            }
-
-            System.Random rng = useFixedSeed ? new System.Random(seed) : new System.Random();
-            var classNames = new List<string>();
-            int totalWritten = 0;
-            bool cancelled = false;
+            string hardNegativesRoot = Path.Combine(projectRoot, hardNegativesFolder);
 
             List<IGrouping<string, SpellTemplate>> groups = templates
                 .GroupBy(t => t.spellName, StringComparer.OrdinalIgnoreCase)
                 .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
+            bool ShouldRegenerate(string className) =>
+                regenerateAllClasses || selectedClassesToRegenerate.Contains(className);
+
+            if (regenerateAllClasses)
+            {
+                if (Directory.Exists(root))
+                {
+                    if (!EditorUtility.DisplayDialog("Overwrite Dataset?",
+                            $"'{outputFolder}' already exists. Delete and regenerate?", "Delete & Regenerate", "Cancel"))
+                        return;
+                    Directory.Delete(root, true);
+                }
+            }
+            else
+            {
+                // Selective mode: wipe only the classes being regenerated; everything else on disk stays.
+                var classesToWipe = groups.Select(g => g.Key).Where(ShouldRegenerate)
+                    .Concat(includeNegativeClass && ShouldRegenerate(negativeClassName)
+                        ? new[] { negativeClassName } : Array.Empty<string>())
+                    .ToList();
+
+                if (classesToWipe.Count == 0)
+                {
+                    Debug.LogWarning("[SyntheticDatasetGenerator] No classes selected to regenerate.");
+                    return;
+                }
+
+                foreach (string className in classesToWipe) DeleteClassFolders(trainRoot, valRoot, SanitizeClassName(className));
+            }
+            Directory.CreateDirectory(trainRoot);
+            Directory.CreateDirectory(valRoot);
+
+            System.Random rng = useFixedSeed ? new System.Random(seed) : new System.Random();
+            int totalWritten = 0;
+            bool cancelled = false;
             var recordingCounts = new List<string>();
 
             for (int g = 0; g < groups.Count && !cancelled; g++)
             {
                 IGrouping<string, SpellTemplate> group = groups[g];
+                if (!ShouldRegenerate(group.Key)) continue;
                 string className = SanitizeClassName(group.Key);
-                classNames.Add(className);
 
                 List<TemplateSource> sources = group.Select(t =>
                 {
@@ -188,8 +262,7 @@ namespace SpellDrawing.EditorTools
                         break;
                     }
 
-                    // Cycle through recordings round-robin (not random) so every recording gets an
-                    // even share of images regardless of how many there are, deterministically.
+                    // Round-robin, not random, so every recording gets an even share deterministically.
                     TemplateSource source = sources[i % sources.Count];
                     List<Vector2> augmented = Augment(source.basePoints, rng, source.maxRotationDeg, source.shapeScale);
                     float thickness = Lerp(rng, strokeThicknessMin, strokeThicknessMax);
@@ -201,12 +274,19 @@ namespace SpellDrawing.EditorTools
                     DestroyImmediate(tex);
                     totalWritten++;
                 }
+
+                int merged = MergeHardNegatives(hardNegativesRoot, className, trainDir, valDir, valSplit);
+                if (merged > 0)
+                {
+                    totalWritten += merged;
+                    recordingCounts[recordingCounts.Count - 1] += $" + {merged} hard negative{(merged == 1 ? "" : "s")}";
+                }
             }
 
-            if (includeNegativeClass && !cancelled)
+            bool shouldGenerateNegative = includeNegativeClass && !cancelled && ShouldRegenerate(negativeClassName);
+            if (shouldGenerateNegative)
             {
                 string className = SanitizeClassName(negativeClassName);
-                classNames.Add(className);
 
                 string trainDir = Path.Combine(trainRoot, className);
                 string valDir = Path.Combine(valRoot, className);
@@ -214,20 +294,41 @@ namespace SpellDrawing.EditorTools
                 Directory.CreateDirectory(valDir);
 
                 int valCount = Mathf.RoundToInt(negativeImagesCount * valSplit);
+
+                // Phase 1: generate + reject-check in parallel (pure struct math, no Unity engine calls,
+                // safe off the main thread). Each iteration gets its own System.Random — not thread-safe
+                // to share one.
+                var shapes = new List<Vector2>[negativeImagesCount];
+                var thicknesses = new float[negativeImagesCount];
+                var perImageRejections = new int[negativeImagesCount];
+                int baseSeed = useFixedSeed ? seed : Environment.TickCount;
+
+                EditorUtility.DisplayProgressBar("Generating Synthetic Dataset",
+                    $"{negativeClassName}: searching for non-colliding shapes...", 0f);
+                Parallel.For(0, negativeImagesCount, i =>
+                {
+                    var localRng = new System.Random(baseSeed + i);
+                    int localRejections = 0;
+                    shapes[i] = GenerateNegativeShape(
+                        localRng, NegativeShapePointCount, templates, maxSimilarityToRealSpell,
+                        maxAspectDifferenceToReject, ref localRejections);
+                    thicknesses[i] = Lerp(localRng, strokeThicknessMin, strokeThicknessMax);
+                    perImageRejections[i] = localRejections;
+                });
+
+                // Phase 2: rasterize + save, sequential (Texture2D/EncodeToPNG need the main thread).
                 int rejectedAttempts = 0;
                 for (int i = 0; i < negativeImagesCount; i++)
                 {
                     if (EditorUtility.DisplayCancelableProgressBar("Generating Synthetic Dataset",
-                            $"{negativeClassName}: {i + 1}/{negativeImagesCount}", (float)i / negativeImagesCount))
+                            $"{negativeClassName}: saving {i + 1}/{negativeImagesCount}", (float)i / negativeImagesCount))
                     {
                         cancelled = true;
                         break;
                     }
 
-                    List<Vector2> shape = GenerateNegativeShape(
-                        rng, NegativeShapePointCount, templates, maxSimilarityToRealSpell, ref rejectedAttempts);
-                    float thickness = Lerp(rng, strokeThicknessMin, strokeThicknessMax);
-                    Texture2D tex = StrokeRasterizer.Rasterize(shape, imageSize, thickness, 0.12f);
+                    rejectedAttempts += perImageRejections[i];
+                    Texture2D tex = StrokeRasterizer.Rasterize(shapes[i], imageSize, thicknesses[i], 0.12f);
 
                     string dir = i < valCount ? valDir : trainDir;
                     string path = Path.Combine(dir, $"{className}_{i:D4}.png");
@@ -241,12 +342,24 @@ namespace SpellDrawing.EditorTools
                     Debug.Log($"[SyntheticDatasetGenerator] Discarded {rejectedAttempts} negative-class candidate(s) " +
                               $"that resembled a real spell too closely (score >= {maxSimilarityToRealSpell:F2}).");
                 }
+
+                int mergedNegatives = MergeHardNegatives(hardNegativesRoot, className, trainDir, valDir, valSplit);
+                if (mergedNegatives > 0)
+                {
+                    totalWritten += mergedNegatives;
+                    Debug.Log($"[SyntheticDatasetGenerator] Folded in {mergedNegatives} hard negative(s) for '{negativeClassName}'.");
+                }
             }
 
             EditorUtility.ClearProgressBar();
 
-            classNames.Sort(StringComparer.OrdinalIgnoreCase);
-            File.WriteAllText(Path.Combine(root, "classes.json"), ToJsonArray(classNames));
+            // Built from whatever class folders actually exist on disk, not just what this run
+            // touched — correct for both full and selective regeneration.
+            List<string> finalClassNames = Directory.Exists(trainRoot)
+                ? Directory.GetDirectories(trainRoot).Select(Path.GetFileName)
+                    .OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList()
+                : new List<string>();
+            File.WriteAllText(Path.Combine(root, "classes.json"), ToJsonArray(finalClassNames));
 
             if (cancelled)
             {
@@ -254,18 +367,42 @@ namespace SpellDrawing.EditorTools
                 return;
             }
 
-            if (includeNegativeClass) recordingCounts.Add($"{negativeClassName} (procedural)");
-            Debug.Log($"Generated {totalWritten} images across {classNames.Count} classes at: {root}\n" +
-                      $"Classes: {string.Join(", ", recordingCounts)}");
+            if (shouldGenerateNegative) recordingCounts.Add($"{negativeClassName} (procedural)");
+            Debug.Log($"Generated {totalWritten} images this run. {finalClassNames.Count} total classes now " +
+                      $"on disk at: {root}\nRegenerated this run: {string.Join(", ", recordingCounts)}");
             EditorUtility.RevealInFinder(root);
         }
 
-        /// <summary>Rotation, then a random per-axis stretch, then per-point jitter (jitter scaled to
-        /// the shape's own bounding box, since CapturedPoints aren't pre-scaled like $1's
-        /// NormalizedPoints). The stretch is non-uniform (independent X/Y factors) deliberately —
-        /// unlike uniform scale, it survives StrokeRasterizer's fit-to-square step, so it's the only
-        /// way to teach the classifier that a shape drawn a bit taller/wider than usual is still the
-        /// same spell, rather than letting aspect ratio become a shortcut for telling classes apart.</summary>
+        private static void DeleteClassFolders(string trainRoot, string valRoot, string className)
+        {
+            string trainDir = Path.Combine(trainRoot, className);
+            string valDir = Path.Combine(valRoot, className);
+            if (Directory.Exists(trainDir)) Directory.Delete(trainDir, true);
+            if (Directory.Exists(valDir)) Directory.Delete(valDir, true);
+        }
+
+        /// <summary>Copies (not moves — the staging folder is a persistent bank) whatever's in
+        /// hardNegativesRoot/&lt;className&gt; into the class's train/val split.</summary>
+        private static int MergeHardNegatives(string hardNegativesRoot, string className, string trainDir, string valDir, float valSplit)
+        {
+            string sourceDir = Path.Combine(hardNegativesRoot, className);
+            if (!Directory.Exists(sourceDir)) return 0;
+
+            string[] files = Directory.GetFiles(sourceDir, "*.png");
+            if (files.Length == 0) return 0;
+
+            int valCount = Mathf.RoundToInt(files.Length * valSplit);
+            for (int i = 0; i < files.Length; i++)
+            {
+                string destDir = i < valCount ? valDir : trainDir;
+                string destPath = Path.Combine(destDir, $"hardneg_{Path.GetFileName(files[i])}");
+                File.Copy(files[i], destPath, overwrite: true);
+            }
+            return files.Length;
+        }
+
+        /// <summary>Rotation, then a non-uniform per-axis stretch (unlike uniform scale, this survives
+        /// StrokeRasterizer's fit-to-square step), then per-point jitter scaled to the shape's own size.</summary>
         private List<Vector2> Augment(List<Vector2> basePoints, System.Random rng, float rotationRangeDeg, float shapeScale)
         {
             float angle = Lerp(rng, -rotationRangeDeg, rotationRangeDeg) * Mathf.Deg2Rad;
@@ -284,45 +421,106 @@ namespace SpellDrawing.EditorTools
             return result;
         }
 
-        /// <summary>Picks one of a few "junk" archetypes (ellipse, irregular polygon, random-walk
-        /// scribble), then checks it against the real templates via $1 — a near-circular ellipse or
-        /// near-square quadrilateral can coincidentally land close to a real Circle/Square, and
-        /// labeling that "not a spell" would directly contradict the real class's own training images
-        /// of the same shape. Retries (bounded) until it finds one that's genuinely dissimilar.</summary>
+        /// <summary>Picks a random "junk" archetype, jitters it, and retries (bounded) until
+        /// TooCloseToAnyTemplate says it's genuinely dissimilar from every real spell.</summary>
         private static List<Vector2> GenerateNegativeShape(
             System.Random rng, int pointCount, IReadOnlyList<SpellTemplate> realTemplates,
-            float maxSimilarity, ref int rejectedAttempts)
+            float maxSimilarity, float maxAspectDifference, ref int rejectedAttempts)
         {
             List<Vector2> candidate = null;
             for (int attempt = 0; attempt < MaxNegativeGenerationAttempts; attempt++)
             {
-                candidate = rng.Next(3) switch
+                candidate = rng.Next(7) switch
                 {
                     0 => GenerateEllipse(rng, pointCount),
                     1 => GeneratePolygon(rng, pointCount),
-                    _ => GenerateScribble(rng, pointCount),
+                    2 => GenerateScribble(rng, pointCount),
+                    3 => GenerateSpiky(rng, pointCount),
+                    4 => GenerateChaoticSpiral(rng, pointCount),
+                    5 => GenerateTangle(rng, pointCount),
+                    _ => GenerateStarPolygon(rng, pointCount),
                 };
+                candidate = ApplyNaturalJitter(candidate, rng);
 
-                if (SimilarityToAnyTemplate(candidate, realTemplates) < maxSimilarity) return candidate;
+                if (!TooCloseToAnyTemplate(candidate, realTemplates, maxSimilarity, maxAspectDifference)) return candidate;
 
                 rejectedAttempts++;
             }
             return candidate; // gave up after MaxNegativeGenerationAttempts — use the last try anyway
         }
 
-        /// <summary>$1 only searches a rotation window, not tracing direction — a shape traced
-        /// clockwise vs. the same shape traced counterclockwise can score as very dissimilar even
-        /// though they'd rasterize identically. Our procedural shapes always trace one fixed
-        /// direction (increasing angle), but a real recorded template could be either, so checking
-        /// only the forward order would let same-direction-only collisions slip past. Checking both
-        /// orderings and taking the higher score closes that gap.</summary>
-        private static float SimilarityToAnyTemplate(List<Vector2> candidate, IReadOnlyList<SpellTemplate> realTemplates)
+        /// <summary>Two independent ways to be "too close to a real spell": $1 shape score + aspect
+        /// match (catches structural collisions), OR aspect + corner-score match directly (a coarser
+        /// but more robust fingerprint — $1's distance alone isn't reliable enough to gate on, since it
+        /// can read artificially low for shapes that are structurally similar but not a precise
+        /// point-for-point match).</summary>
+        private static bool TooCloseToAnyTemplate(
+            List<Vector2> candidate, IReadOnlyList<SpellTemplate> realTemplates,
+            float maxSimilarity, float maxAspectDifference)
         {
-            float forward = DollarOneRecognizer.Recognize(candidate, realTemplates).score;
+            float candidateAspect = DollarOneRecognizer.ComputeAspectRatio(candidate);
+            float candidateCornerScore = DollarOneRecognizer.ComputeCornerScore(DollarOneRecognizer.Normalize(candidate));
+
+            foreach (SpellTemplate template in realTemplates)
+            {
+                if (template == null || template.CapturedPoints.Count < 3) continue;
+
+                float templateAspect = DollarOneRecognizer.ComputeAspectRatio(template.CapturedPoints);
+                float aspectDiff = Mathf.Abs(candidateAspect - templateAspect);
+                if (aspectDiff >= maxAspectDifference) continue;
+
+                float cornerDiff = Mathf.Abs(candidateCornerScore - template.CornerScore);
+                if (cornerDiff < MaxCornerDifferenceToReject) return true;
+            }
+
+            return ShapeSimilarityToAnyTemplate(candidate, realTemplates) >= maxSimilarity
+                   && AspectMatchesAnyTemplate(candidateAspect, realTemplates, maxAspectDifference);
+        }
+
+        private static bool AspectMatchesAnyTemplate(
+            float candidateAspect, IReadOnlyList<SpellTemplate> realTemplates, float maxAspectDifference)
+        {
+            foreach (SpellTemplate template in realTemplates)
+            {
+                if (template == null || template.CapturedPoints.Count < 3) continue;
+                float templateAspect = DollarOneRecognizer.ComputeAspectRatio(template.CapturedPoints);
+                if (Mathf.Abs(candidateAspect - templateAspect) < maxAspectDifference) return true;
+            }
+            return false;
+        }
+
+        /// <summary>Small per-point jitter so negative shapes look hand-drawn, not mathematically
+        /// perfect. Scaled per-point by that point's own distance from the centroid, not one global
+        /// bounding-box size — a spiky shape's inner points sit much closer to center than its outer
+        /// tips, so a single global scale would swamp the inner detail in noise.</summary>
+        private static List<Vector2> ApplyNaturalJitter(List<Vector2> points, System.Random rng)
+        {
+            Vector2 centroid = Vector2.zero;
+            foreach (Vector2 p in points) centroid += p;
+            centroid /= points.Count;
+
+            var result = new List<Vector2>(points.Count);
+            foreach (Vector2 p in points)
+            {
+                float localScale = Mathf.Max(Vector2.Distance(p, centroid), 1f);
+                Vector2 jitter = new Vector2(Lerp(rng, -NegativeJitterFraction, NegativeJitterFraction),
+                                              Lerp(rng, -NegativeJitterFraction, NegativeJitterFraction)) * localScale;
+                result.Add(p + jitter);
+            }
+            return result;
+        }
+
+        /// <summary>Checks both point orderings (our archetypes always trace one fixed direction, but
+        /// a real template could be either) with the full 360deg rotation search (unlike live
+        /// gameplay's +/-45deg window — a rotationally symmetric candidate has no meaningful "start
+        /// point", so the narrow window would only sometimes land close enough to reveal true similarity).</summary>
+        private static float ShapeSimilarityToAnyTemplate(List<Vector2> candidate, IReadOnlyList<SpellTemplate> realTemplates)
+        {
+            float forward = DollarOneRecognizer.Recognize(candidate, realTemplates, fullRotationSearch: true).score;
 
             var reversed = new List<Vector2>(candidate);
             reversed.Reverse();
-            float backward = DollarOneRecognizer.Recognize(reversed, realTemplates).score;
+            float backward = DollarOneRecognizer.Recognize(reversed, realTemplates, fullRotationSearch: true).score;
 
             return Mathf.Max(forward, backward);
         }
@@ -357,6 +555,123 @@ namespace SpellDrawing.EditorTools
             }
             vertices.Add(vertices[0]);
             return ResamplePolyline(vertices, pointCount);
+        }
+
+        /// <summary>Alternates outer/inner radius per vertex to produce spiky, concave, trident-like
+        /// shapes — the only archetype with real concave structure. Irregular spacing/ratio keeps it
+        /// from reliably looking like a clean Star (the $1 similarity check is the actual safety net
+        /// for that).</summary>
+        private static List<Vector2> GenerateSpiky(System.Random rng, int pointCount)
+        {
+            int prongCount = rng.Next(3, 8);
+            var vertices = new List<Vector2>(prongCount * 2 + 1);
+
+            for (int i = 0; i < prongCount * 2; i++)
+            {
+                bool isOuter = i % 2 == 0;
+                float angle = (float)i / (prongCount * 2) * Mathf.PI * 2f + Lerp(rng, -0.15f, 0.15f);
+                float outerRadius = Lerp(rng, 80f, 150f);
+                float radius = isOuter ? outerRadius : outerRadius * Lerp(rng, 0.15f, 0.6f);
+                vertices.Add(new Vector2(Mathf.Cos(angle) * radius, Mathf.Sin(angle) * radius));
+            }
+            vertices.Add(vertices[0]);
+            return ResamplePolyline(vertices, pointCount);
+        }
+
+        /// <summary>A multi-turn spiral with sharp local radius spikes at random points along its
+        /// length — protrusions scatter across many directions (unlike GenerateSpiky's evenly-spaced
+        /// layout), denser and less symmetric than any other archetype.</summary>
+        private static List<Vector2> GenerateChaoticSpiral(System.Random rng, int pointCount)
+        {
+            float turns = Lerp(rng, 1.3f, 3f);
+            float totalAngle = turns * Mathf.PI * 2f;
+            float startRadius = Lerp(rng, 10f, 40f);
+            float endRadius = Lerp(rng, 80f, 160f);
+            float rotationOffset = Lerp(rng, 0f, 360f) * Mathf.Deg2Rad;
+
+            int protrusionCount = rng.Next(3, 8);
+            var protrusionAngles = new float[protrusionCount];
+            var protrusionStrengths = new float[protrusionCount];
+            for (int p = 0; p < protrusionCount; p++)
+            {
+                protrusionAngles[p] = Lerp(rng, 0f, totalAngle);
+                protrusionStrengths[p] = Lerp(rng, 0.3f, 0.9f);
+            }
+            const float protrusionWindow = 0.35f; // radians of spiral angle each spike affects
+
+            var points = new List<Vector2>(pointCount);
+            for (int i = 0; i < pointCount; i++)
+            {
+                float t = (float)i / (pointCount - 1);
+                float angle = t * totalAngle;
+                float radius = Mathf.Lerp(startRadius, endRadius, t);
+
+                float bump = 0f;
+                for (int p = 0; p < protrusionCount; p++)
+                {
+                    float diff = Mathf.Abs(angle - protrusionAngles[p]);
+                    if (diff < protrusionWindow) bump += protrusionStrengths[p] * (1f - diff / protrusionWindow);
+                }
+                radius *= 1f + bump;
+
+                float finalAngle = angle + rotationOffset;
+                points.Add(new Vector2(Mathf.Cos(finalAngle) * radius, Mathf.Sin(finalAngle) * radius));
+            }
+            return points;
+        }
+
+        /// <summary>Several overlapping circular loops, each sweeping past 360deg — self-intersects
+        /// both within a loop and across loops, unlike the single continuous curves of the other
+        /// archetypes.</summary>
+        private static List<Vector2> GenerateTangle(System.Random rng, int pointCount)
+        {
+            int loopCount = rng.Next(3, 6);
+            int pointsPerLoop = Mathf.Max(pointCount / loopCount, 4);
+            var points = new List<Vector2>(pointsPerLoop * loopCount);
+
+            for (int i = 0; i < loopCount; i++)
+            {
+                Vector2 center = new Vector2(Lerp(rng, -40f, 40f), Lerp(rng, -40f, 40f));
+                float radius = Lerp(rng, 40f, 90f);
+                float startAngle = Lerp(rng, 0f, 360f) * Mathf.Deg2Rad;
+                float sweep = Lerp(rng, 220f, 420f) * Mathf.Deg2Rad; // often > full circle: guarantees self-crossing
+
+                for (int j = 0; j < pointsPerLoop; j++)
+                {
+                    float t = (float)j / (pointsPerLoop - 1);
+                    float angle = startAngle + t * sweep;
+                    points.Add(center + new Vector2(Mathf.Cos(angle), Mathf.Sin(angle)) * radius);
+                }
+            }
+            return ResamplePolyline(points, pointCount);
+        }
+
+        /// <summary>Built like an actual star polygon: vertices around a circle, connected non-
+        /// adjacently (skip &gt;= 2) instead of to neighbors — self-intersecting straight strokes,
+        /// same principle as a pentagram.</summary>
+        private static List<Vector2> GenerateStarPolygon(System.Random rng, int pointCount)
+        {
+            int vertexCount = rng.Next(4, 9);
+            int skip = rng.Next(2, Mathf.Max(3, vertexCount - 1));
+            float baseRadius = Lerp(rng, 80f, 150f);
+            float rotationOffset = Lerp(rng, 0f, 360f) * Mathf.Deg2Rad;
+
+            var vertices = new Vector2[vertexCount];
+            for (int i = 0; i < vertexCount; i++)
+            {
+                float angle = (float)i / vertexCount * Mathf.PI * 2f + rotationOffset;
+                float radius = baseRadius * Lerp(rng, 0.8f, 1.2f);
+                vertices[i] = new Vector2(Mathf.Cos(angle) * radius, Mathf.Sin(angle) * radius);
+            }
+
+            var path = new List<Vector2>(vertexCount + 1);
+            int idx = 0;
+            for (int s = 0; s <= vertexCount; s++)
+            {
+                path.Add(vertices[idx % vertexCount]);
+                idx += skip;
+            }
+            return ResamplePolyline(path, pointCount);
         }
 
         private static List<Vector2> GenerateScribble(System.Random rng, int pointCount)
